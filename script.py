@@ -87,7 +87,6 @@ PAGE_SIZE = 500
 MAX_PAGES = 2000  # safety bound for runaway pagination
 DEFAULT_TIMEOUT = 60
 
-STALE_DAYS_DEFAULT = 90
 ADMIN_RATIO_THRESHOLD = 0.05
 SAML_COVERAGE_THRESHOLD = 0.80
 
@@ -168,7 +167,6 @@ class Finding:
 class AuditContext:
     base_url: str
     output_dir: Path
-    stale_days: int
     concurrency: int
     rate_limiter: RateLimiter
     session: requests.Session
@@ -618,71 +616,144 @@ def check3_teams(ctx: AuditContext, teams: list[dict], applications: list[dict])
 
 
 # ---------------------------------------------------------------------------
-# Check 4 - Privileged users and stale accounts
+# Check 4 - Privileged users and orphan accounts
 # ---------------------------------------------------------------------------
+#
+# Note on stale-by-last-login detection
+# -------------------------------------
+# The Veracode Identity API does NOT expose a per-user last_login timestamp.
+# The only login-related data is available through the UI activity log
+# (Admin > Users > [user] > Activity Log), which requires Administrator role
+# and is not API-accessible.
+#
+# This check therefore detects "orphan-like" account states that ARE exposed
+# by the API and that often correlate with the threats stale-account checks
+# are meant to catch:
+#   - active=true but login_enabled=false  (login disabled, not deactivated)
+#   - active=true but no roles assigned    (zombie account)
+#   - active=true but no team assignment   (effectively no access scope, but
+#                                           still counts as a seat)
+#   - inactive=true accounts (deactivated but still present)
+#
+# For true stale-by-time detection, customers must either:
+#   1. Pull the activity log from the UI and feed it to this script as a CSV
+#   2. Track login events via SAML IdP logs (Okta, Entra, etc.)
+#   3. Run check 7 frequently to detect snapshot-to-snapshot changes
 
-def check4_privileged_and_stale(ctx: AuditContext, users: list[dict]) -> None:
+
+def check4_privileged_and_orphans(ctx: AuditContext, users: list[dict]) -> None:
     privileged: list[dict] = []
-    stale: list[dict] = []
+    orphan_no_roles: list[dict] = []
+    orphan_no_teams: list[dict] = []
+    login_disabled_active: list[dict] = []
     inactive_disabled: list[dict] = []
-    now = dt.datetime.now(dt.timezone.utc)
-    cutoff = now - dt.timedelta(days=ctx.stale_days)
 
     for u in users:
         raw_roles, normalized = get_user_roles(u)
         is_privileged = bool(normalized & PRIVILEGED_ROLES)
-
-        last_login_raw = (
-            u.get("last_login")
-            or (u.get("login_account") or {}).get("last_login")
-        )
-        last_login_dt = parse_last_login(last_login_raw)
+        is_active = bool(u.get("active"))
+        login_enabled = u.get("login_enabled")
+        login_enabled_bool = True if login_enabled is None else bool(login_enabled)
+        teams = u.get("teams") or []
+        is_api = is_api_service_account(u)
 
         row = {
             "user_id": u.get("user_id"),
             "user_name": u.get("user_name"),
             "email": u.get("email_address"),
-            "active": u.get("active"),
+            "active": is_active,
+            "login_enabled": login_enabled_bool,
+            "is_api_service_account": is_api,
             "is_privileged": is_privileged,
+            "role_count": len(raw_roles),
+            "team_count": len(teams),
             "roles": ", ".join(raw_roles),
-            "last_login": last_login_raw or "never",
-            "days_since_login": (now - last_login_dt).days if last_login_dt else "n/a",
         }
 
-        if not u.get("active"):
+        if not is_active:
             inactive_disabled.append(row)
             continue
+
         if is_privileged:
             privileged.append(row)
-        if last_login_dt is None or last_login_dt < cutoff:
-            stale.append(row)
 
-    fields = ["user_id", "user_name", "email", "active", "is_privileged",
-              "roles", "last_login", "days_since_login"]
+        # Active but login disabled - candidate for full deactivation
+        if not login_enabled_bool:
+            login_disabled_active.append(row)
+
+        # Active but no roles - zombie account
+        if not raw_roles:
+            orphan_no_roles.append(row)
+
+        # Active human (non-API) but no team assignment - effectively no access scope
+        # API service accounts often have noteamrestrictionapi role intentionally,
+        # so they are excluded from this check.
+        if not is_api and not teams and "noteamrestrictionapi" not in normalized:
+            orphan_no_teams.append(row)
+
+    fields = ["user_id", "user_name", "email", "active", "login_enabled",
+              "is_api_service_account", "is_privileged", "role_count",
+              "team_count", "roles"]
     write_csv(ctx.output_dir / "04_privileged_users_active.csv", privileged, fields)
-    write_csv(ctx.output_dir / "04_stale_accounts.csv", stale, fields)
+    write_csv(ctx.output_dir / "04_orphan_no_roles.csv", orphan_no_roles, fields)
+    write_csv(ctx.output_dir / "04_orphan_no_teams.csv", orphan_no_teams, fields)
+    write_csv(ctx.output_dir / "04_login_disabled_active.csv", login_disabled_active, fields)
     write_csv(ctx.output_dir / "04_disabled_accounts.csv", inactive_disabled, fields)
 
-    if stale:
-        sev = "High" if any(s["is_privileged"] for s in stale) else "Medium"
+    if orphan_no_roles:
+        sev = "High" if any(r["is_privileged"] for r in orphan_no_roles) else "Medium"
         ctx.add_finding(Finding(
-            check="4. Privileged Users & Stale Accounts",
+            check="4. Privileged Users & Orphan Accounts",
             control="Account Lifecycle",
             severity=sev,
-            title=f"{len(stale)} active accounts without login in {ctx.stale_days}+ days",
+            title=f"{len(orphan_no_roles)} active accounts with no roles assigned",
             detail=(
-                "Inactive accounts represent attack surface. "
-                "Cross-check with HRIS to identify former employees and disable."
+                "Accounts marked active but with zero roles. These can still occupy "
+                "a license seat and expose the platform to unintended state. "
+                "Validate whether each should be deactivated or assigned roles."
             ),
-            evidence="04_stale_accounts.csv",
+            evidence="04_orphan_no_roles.csv",
+        ))
+
+    if orphan_no_teams:
+        ctx.add_finding(Finding(
+            check="4. Privileged Users & Orphan Accounts",
+            control="Account Lifecycle",
+            severity="Low",
+            title=f"{len(orphan_no_teams)} active human accounts without team assignment",
+            detail=(
+                "Accounts with no team membership and no global override role "
+                "(noteamrestrictionapi). They may still hold roles that grant access "
+                "to specific applications or platform-wide functions, but lack the "
+                "scope segmentation teams provide."
+            ),
+            evidence="04_orphan_no_teams.csv",
+        ))
+
+    if login_disabled_active:
+        ctx.add_finding(Finding(
+            check="4. Privileged Users & Orphan Accounts",
+            control="Account Lifecycle",
+            severity="Low",
+            title=f"{len(login_disabled_active)} active accounts with login disabled",
+            detail=(
+                "active=true but login_enabled=false. Effectively unable to sign in "
+                "but still appears in the user roster. Recommend full deactivation."
+            ),
+            evidence="04_login_disabled_active.csv",
         ))
 
     ctx.add_finding(Finding(
-        check="4. Privileged Users & Stale Accounts",
+        check="4. Privileged Users & Orphan Accounts",
         control="Privileged Access Review",
         severity="Informational",
         title=f"{len(privileged)} active privileged users in tenant",
-        detail="Validate against customer RACI matrix. Recommended cadence: quarterly.",
+        detail=(
+            "Validate against customer RACI matrix. Recommended cadence: quarterly. "
+            "Note: per-user last-login timestamps are not exposed by the Veracode "
+            "Identity API; for activity-based stale detection, pull the UI activity "
+            "log or correlate with SAML IdP login events."
+        ),
         evidence="04_privileged_users_active.csv",
     ))
 
@@ -761,41 +832,72 @@ def check5_traceability(ctx: AuditContext, run_audit_check: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def check6_hardening(ctx: AuditContext, users: list[dict]) -> None:
+    """Account hardening signals.
+
+    SAML detection uses the documented `saml_user` boolean field from the
+    Identity API (https://docs.veracode.com/r/c_identity_intro), which is
+    the same flag used by the search filter `?saml_user=true`. API service
+    accounts are excluded from the SAML coverage calculation since they
+    do not authenticate via SAML.
+    """
     rows: list[dict] = []
     saml_users = 0
-    active = 0
+    active_human = 0  # Excludes API service accounts from SAML coverage
 
     for u in users:
-        login_type = u.get("login_account_type") or ""
         is_active = bool(u.get("active"))
+        is_saml = bool(u.get("saml_user"))
+        is_api = is_api_service_account(u)
+        login_enabled = u.get("login_enabled")
+        # login_enabled may be missing on older records; treat absent as True
+        login_enabled_bool = True if login_enabled is None else bool(login_enabled)
+
         rows.append({
             "user_name": u.get("user_name"),
             "email": u.get("email_address"),
             "ip_restricted": u.get("ip_restricted", False),
-            "login_type": login_type,
+            "saml_user": is_saml,
+            "login_enabled": login_enabled_bool,
+            "is_api_service_account": is_api,
             "active": is_active,
         })
-        if is_active:
-            active += 1
-            if "saml" in login_type.lower():
+
+        # SAML coverage applies to active human users only
+        if is_active and not is_api:
+            active_human += 1
+            if is_saml:
                 saml_users += 1
 
     write_csv(
         ctx.output_dir / "06_account_hardening.csv",
         rows,
-        ["user_name", "email", "ip_restricted", "login_type", "active"],
+        ["user_name", "email", "ip_restricted", "saml_user", "login_enabled",
+         "is_api_service_account", "active"],
     )
 
-    if active and (saml_users / active) < SAML_COVERAGE_THRESHOLD:
+    # Note: login_enabled=false on active accounts is reported in check 4
+    # (orphan accounts) - we don't double-report it here.
+
+    if active_human and (saml_users / active_human) < SAML_COVERAGE_THRESHOLD:
         ctx.add_finding(Finding(
             check="6. Account Hardening",
             control="Authentication Strength",
             severity="Medium",
-            title=f"Only {saml_users}/{active} active users via SAML SSO",
+            title=f"Only {saml_users}/{active_human} active human users via SAML SSO",
             detail=(
                 "Users with local authentication outside SAML break centralized "
-                "identity control and hinder deprovisioning."
+                "identity control and hinder deprovisioning. (API service accounts "
+                "are excluded from this calculation since they authenticate via HMAC.)"
             ),
+            evidence="06_account_hardening.csv",
+        ))
+    else:
+        ctx.add_finding(Finding(
+            check="6. Account Hardening",
+            control="Authentication Strength",
+            severity="Informational",
+            title=f"SAML coverage: {saml_users}/{active_human} active human users",
+            detail="SAML SSO coverage at or above the configured threshold.",
             evidence="06_account_hardening.csv",
         ))
 
@@ -1269,7 +1371,7 @@ CHECK_TITLES: dict[str, str] = {
     "1": "Identity model",
     "2": "RBAC",
     "3": "Team segregation",
-    "4": "Privileged users & stale accounts",
+    "4": "Privileged users & orphan accounts",
     "5": "Traceability",
     "6": "Account hardening",
     "7": "Identity drift detection",
@@ -1279,7 +1381,7 @@ CHECK_DESCRIPTIONS: dict[str, str] = {
     "1": "Verifies every user has an immutable UID distinct from email or username.",
     "2": "Reviews role distribution, administrator ratio, API service accounts, and segregation of duties.",
     "3": "Inventories teams and flags applications without team assignment.",
-    "4": "Lists active privileged users and detects stale or inactive accounts.",
+    "4": "Lists active privileged users and detects orphan accounts (no roles, no teams, login disabled).",
     "5": "Documents what the platform exposes for audit and traceability.",
     "6": "Reports IP restriction and SAML SSO coverage.",
     "7": "Detects identity changes since the previous snapshot: field changes, lifecycle transitions, privilege changes, collisions.",
@@ -1671,7 +1773,7 @@ def run_checks(
     check1_identity_model(ctx, users)
     check2_rbac(ctx, users)
     check3_teams(ctx, teams, applications)
-    check4_privileged_and_stale(ctx, users)
+    check4_privileged_and_orphans(ctx, users)
     check5_traceability(ctx, run_audit_check=enable_change_detection)
     check6_hardening(ctx, users)
     if enable_change_detection:
@@ -1696,8 +1798,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--region", choices=list(REGIONS), default="commercial")
     p.add_argument("--output", default="./output", help="Output directory")
-    p.add_argument("--stale-days", type=int, default=STALE_DAYS_DEFAULT,
-                   help="Days without login to flag an account as stale")
     p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                    help="Max parallel HTTP workers (default 8)")
     p.add_argument("--rate-limit", type=int, default=DEFAULT_RATE_LIMIT_PER_MIN,
@@ -1729,7 +1829,6 @@ def main(argv: list[str] | None = None) -> int:
     ctx = AuditContext(
         base_url=REGIONS[args.region],
         output_dir=Path(args.output),
-        stale_days=args.stale_days,
         concurrency=args.concurrency,
         rate_limiter=RateLimiter(args.rate_limit),
         session=build_session(pool_size=max(args.concurrency * 2, 20)),
