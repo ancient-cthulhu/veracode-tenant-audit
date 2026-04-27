@@ -362,9 +362,53 @@ def get_user_roles(user: dict) -> tuple[list[str], set[str]]:
 
 
 def is_api_service_account(user: dict) -> bool:
-    return any(
-        p.get("permission_name") == "apiUser"
-        for p in user.get("permissions") or []
+    """Detect API service accounts. Per Veracode Identity API docs, the
+    authoritative discriminator is `user_type`, with values like 'API' or
+    'VOSP'. Older or partial responses may not include `user_type`, so we
+    fall back to:
+      - permissions array containing apiUser
+      - any role marked is_api=true
+      - role name matching well-known API role patterns (the `*api` suffix
+        convention used by Veracode for non-human-only roles)
+    """
+    user_type = (user.get("user_type") or "").upper()
+    if user_type == "API":
+        return True
+
+    if any(p.get("permission_name") == "apiUser"
+           for p in user.get("permissions") or []):
+        return True
+
+    # Role-level signals
+    roles = user.get("roles") or []
+    for r in roles:
+        if r.get("is_api") is True:
+            return True
+        name = (r.get("role_name") or "").lower().replace(" ", "").replace("_", "")
+        # Veracode API-only roles end in 'api' (adminapi, uploadapi, resultsapi,
+        # apisubmitanyscan, noteamrestrictionapi, etc.)
+        if name in {"adminapi", "uploadapi", "resultsapi", "apisubmitanyscan",
+                    "noteamrestrictionapi", "submitterapi", "creatorapi"}:
+            return True
+
+    return False
+
+
+def get_user_teams(user: dict) -> list[dict]:
+    """Return the user's team list, normalizing missing/null cases."""
+    return user.get("teams") or []
+
+
+def format_team_label(team: dict) -> str:
+    """Render a team object as a readable label. Identity API uses
+    `team_name` and `team_id`, but defensive fallbacks cover other
+    Veracode contexts (Applications API uses `guid`)."""
+    return (
+        team.get("team_name")
+        or team.get("name")
+        or team.get("team_id")
+        or team.get("guid")
+        or "<unnamed>"
     )
 
 
@@ -447,7 +491,7 @@ def check2_rbac(ctx: AuditContext, users: list[dict]) -> None:
     for u in users:
         raw_roles, normalized = get_user_roles(u)
         is_api = is_api_service_account(u)
-        teams = [t.get("team_name") or t.get("team_id") for t in (u.get("teams") or [])]
+        teams = [format_team_label(t) for t in get_user_teams(u)]
         is_privileged = bool(normalized & PRIVILEGED_ROLES)
         sod_labels = detect_sod_conflicts(normalized)
 
@@ -568,7 +612,7 @@ def check3_teams(ctx: AuditContext, teams: list[dict], applications: list[dict])
             "app_name": profile.get("name"),
             "business_criticality": profile.get("business_criticality", "UNKNOWN"),
             "team_count": len(app_teams),
-            "teams": ", ".join(t.get("team_name", t.get("guid", "")) for t in app_teams),
+            "teams": ", ".join(format_team_label(t) for t in app_teams),
             "business_unit": (profile.get("business_unit") or {}).get("name", ""),
         })
 
@@ -648,14 +692,26 @@ def check4_privileged_and_orphans(ctx: AuditContext, users: list[dict]) -> None:
     login_disabled_active: list[dict] = []
     inactive_disabled: list[dict] = []
 
+    # Roles that grant platform-wide access without needing team membership.
+    # Per Veracode docs: "Only the Executive, Greenlight IDE User, Policy
+    # Administrator, Security Insights, and Security Lead roles do not
+    # require team membership." Plus the API-side equivalents.
+    GLOBAL_SCOPE_ROLES = {
+        "noteamrestrictionapi", "executive", "greenlightideuser",
+        "policyadministrator", "securityinsights", "securitylead",
+        "administrator",  # admins see everything
+    }
+
     for u in users:
         raw_roles, normalized = get_user_roles(u)
         is_privileged = bool(normalized & PRIVILEGED_ROLES)
         is_active = bool(u.get("active"))
         login_enabled = u.get("login_enabled")
         login_enabled_bool = True if login_enabled is None else bool(login_enabled)
-        teams = u.get("teams") or []
+        teams = get_user_teams(u)
+        team_labels = [format_team_label(t) for t in teams]
         is_api = is_api_service_account(u)
+        has_global_scope = bool(normalized & GLOBAL_SCOPE_ROLES)
 
         row = {
             "user_id": u.get("user_id"),
@@ -665,9 +721,11 @@ def check4_privileged_and_orphans(ctx: AuditContext, users: list[dict]) -> None:
             "login_enabled": login_enabled_bool,
             "is_api_service_account": is_api,
             "is_privileged": is_privileged,
+            "has_global_scope_role": has_global_scope,
             "role_count": len(raw_roles),
+            "roles": ", ".join(raw_roles) if raw_roles else "",
             "team_count": len(teams),
-            "roles": ", ".join(raw_roles),
+            "teams": ", ".join(team_labels) if team_labels else "",
         }
 
         if not is_active:
@@ -685,15 +743,15 @@ def check4_privileged_and_orphans(ctx: AuditContext, users: list[dict]) -> None:
         if not raw_roles:
             orphan_no_roles.append(row)
 
-        # Active human (non-API) but no team assignment - effectively no access scope
-        # API service accounts often have noteamrestrictionapi role intentionally,
-        # so they are excluded from this check.
-        if not is_api and not teams and "noteamrestrictionapi" not in normalized:
+        # Active without team scope. We exclude:
+        #  - API service accounts (often intentionally team-less via noteamrestrictionapi)
+        #  - Anyone with a globally-scoped role (Administrator, Security Lead, etc.)
+        if not is_api and not teams and not has_global_scope:
             orphan_no_teams.append(row)
 
     fields = ["user_id", "user_name", "email", "active", "login_enabled",
-              "is_api_service_account", "is_privileged", "role_count",
-              "team_count", "roles"]
+              "is_api_service_account", "is_privileged", "has_global_scope_role",
+              "role_count", "roles", "team_count", "teams"]
     write_csv(ctx.output_dir / "04_privileged_users_active.csv", privileged, fields)
     write_csv(ctx.output_dir / "04_orphan_no_roles.csv", orphan_no_roles, fields)
     write_csv(ctx.output_dir / "04_orphan_no_teams.csv", orphan_no_teams, fields)
@@ -1418,11 +1476,22 @@ def _render_inline_table(csv_path: Path) -> str:
     if not rows:
         return ""
 
+    # Columns that commonly hold long comma-separated strings get a
+    # soft width cap with overflow ellipsis. Customers can read full values
+    # in the underlying CSV; the inline preview prioritizes legibility.
+    LONG_COLS = {"roles", "teams", "details", "modifiers", "current_roles",
+                 "roles_added", "roles_removed"}
+
     head_html = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
-    body_html = "".join(
-        "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in row) + "</tr>"
-        for row in rows
-    )
+    body_html_parts: list[str] = []
+    for row in rows:
+        cells = []
+        for header_name, value in zip(headers, row):
+            cls = ' class="cell-long"' if header_name in LONG_COLS else ""
+            title_attr = f' title="{html.escape(value)}"' if header_name in LONG_COLS and value else ""
+            cells.append(f'<td{cls}{title_attr}>{html.escape(value)}</td>')
+        body_html_parts.append("<tr>" + "".join(cells) + "</tr>")
+    body_html = "".join(body_html_parts)
     more = ""
     if total > len(rows):
         more = (
@@ -1431,7 +1500,12 @@ def _render_inline_table(csv_path: Path) -> str:
             f'See <code>{html.escape(csv_path.name)}</code> for the full list.'
             f'</div>'
         )
-    return f'<table class="evidence"><thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody></table>{more}'
+    return (
+        f'<div class="evidence-wrap">'
+        f'<table class="evidence"><thead><tr>{head_html}</tr></thead>'
+        f'<tbody>{body_html}</tbody></table>'
+        f'</div>{more}'
+    )
 
 
 def _render_finding_card(ctx: AuditContext, f: Finding, embed_table: bool) -> str:
@@ -1639,20 +1713,49 @@ def render_html(ctx: AuditContext, totals: dict[str, int]) -> Path:
       background: rgba(0,0,0,0.06); padding: 1px 5px; border-radius: 3px;
       font-size: 11px; font-family: 'SF Mono', Consolas, monospace;
     }}
+    .evidence-wrap {{
+      margin-top: 8px;
+      border: 1px solid rgba(0,0,0,0.08);
+      border-radius: 6px;
+      overflow-x: auto;
+      overflow-y: visible;
+      max-width: 100%;
+      /* visual hint that the table can scroll */
+      background:
+        linear-gradient(to right, white 30%, rgba(255,255,255,0)),
+        linear-gradient(to right, rgba(0,0,0,0.06), rgba(255,255,255,0) 70%) 0 100%,
+        linear-gradient(to left, white 30%, rgba(255,255,255,0)) 100% 0,
+        linear-gradient(to left, rgba(0,0,0,0.06), rgba(255,255,255,0) 70%) 100% 0;
+      background-repeat: no-repeat;
+      background-size: 30px 100%, 14px 100%, 30px 100%, 14px 100%;
+      background-attachment: local, scroll, local, scroll;
+    }}
     table.evidence {{
-      width: 100%; border-collapse: collapse; font-size: 12px;
-      background: white; border-radius: 6px; overflow: hidden;
-      margin-top: 8px; border: 1px solid rgba(0,0,0,0.08);
+      width: max-content;
+      min-width: 100%;
+      border-collapse: collapse; font-size: 12px;
+      background: white;
     }}
     table.evidence th {{
       background: #f5f6fa; font-weight: 500; text-align: left;
       padding: 6px 10px; color: #586069; font-size: 11px;
       text-transform: uppercase; letter-spacing: 0.3px;
       border-bottom: 1px solid #e1e4e8;
+      white-space: nowrap;
+      position: sticky; top: 0;
     }}
     table.evidence td {{
       padding: 6px 10px; border-bottom: 1px solid #f0f2f5;
       vertical-align: top; font-size: 12px;
+      white-space: nowrap;
+    }}
+    /* Long string columns (role/team lists) get a soft cap with an ellipsis,
+       but the full value is in the title attribute (browser tooltip) and
+       fully visible in the underlying CSV. */
+    table.evidence td.cell-long {{
+      max-width: 360px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }}
     table.evidence tr:last-child td {{ border-bottom: none; }}
     .more-note {{
@@ -1738,16 +1841,75 @@ def render_html(ctx: AuditContext, totals: dict[str, int]) -> Path:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def get_user_detail(ctx: AuditContext, user_id: str) -> dict:
+    """Fetch a single user's full record from /users/{user_id}.
+
+    The list endpoint /users?detailed=true returns a partial view that
+    typically OMITS the teams[], permissions[], and full roles[] arrays.
+    For accurate detection of API service accounts, team membership, and
+    role inventory, each user must be fetched individually.
+    """
+    url = f"{ctx.base_url}/api/authn/v2/users/{user_id}"
+    resp = _veracode_get(ctx, url)
+    _raise_for_known_errors(resp)
+    return resp.json()
+
+
+def enrich_users_concurrent(
+    ctx: AuditContext,
+    users_summary: list[dict],
+) -> list[dict]:
+    """Fetch the full record for every user in parallel, respecting the
+    rate limiter. Falls back to the summary record on individual failures."""
+    if not users_summary:
+        return []
+
+    log.info("Enriching %d users via /users/{id} (concurrency=%d)...",
+             len(users_summary), ctx.concurrency)
+
+    enriched: list[dict] = [None] * len(users_summary)  # type: ignore
+
+    def fetch_one(idx: int, user: dict) -> tuple[int, dict]:
+        uid = user.get("user_id")
+        if not uid:
+            return idx, user
+        try:
+            return idx, get_user_detail(ctx, uid)
+        except (requests.HTTPError, requests.ConnectionError) as e:
+            log.warning("  could not enrich user %s: %s", uid, e)
+            return idx, user
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=ctx.concurrency) as pool:
+        futures = [
+            pool.submit(fetch_one, i, u)
+            for i, u in enumerate(users_summary)
+        ]
+        for future in as_completed(futures):
+            idx, user = future.result()
+            enriched[idx] = user
+            completed += 1
+            if completed % 100 == 0:
+                log.info("  %d/%d users enriched", completed, len(users_summary))
+
+    return enriched
+
+
 def fetch_tenant(
     ctx: AuditContext,
     skip_apps: bool,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    log.info("Fetching users (detailed)...")
-    users = get_paginated(
+    log.info("Fetching users (summary)...")
+    users_summary = get_paginated(
         ctx, "/api/authn/v2/users", "users",
         params={"detailed": "true"},
     )
-    log.info("  -> %d users", len(users))
+    log.info("  -> %d users", len(users_summary))
+
+    # The list response does NOT reliably include teams[], permissions[],
+    # or the full roles[] array per user. Fetch each user individually
+    # in parallel to get the complete record.
+    users = enrich_users_concurrent(ctx, users_summary)
 
     log.info("Fetching teams...")
     teams = get_paginated(ctx, "/api/authn/v2/teams", "teams")
