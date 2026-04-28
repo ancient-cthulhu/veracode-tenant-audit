@@ -70,13 +70,13 @@ python veracode_tenant_audit.py --enable-change-detection --snapshot-dir /var/li
 ```
 
 ## Check 7 drift categories
-
+ 
 | Category | Severity | What it catches |
 |---|---|---|
 | `username_collisions` | **Critical** | Current user_name appears under a different UID than before. Veracode says usernames are non-recyclable; if this triggers, escalate immediately. |
 | `privileged_email_changes` | **High** | Email change on an account holding Administrator, Security Lead, or other privileged roles. |
 | `privilege_acquired` | **High** | UID gained privileged role status since the last snapshot. |
-| `email_collisions` | **High** | Same email address held by 2+ active UIDs. Indicates duplicate accounts, IdP misconfiguration, or attempted impersonation. |
+| `email_collisions` | **High** | Same email address held by 2+ human accounts, or 2+ API service accounts. A single human paired with their own API service account (intentional Veracode pattern) is NOT flagged. |
 | `cross_domain_emails` | **High** | Email change crossed organizational domain (e.g. `@corp.com` → `@gmail.com`). |
 | `field_changes` | **Medium** | Per-field changes to email, user_name, first_name, last_name. Note: user_name changes should never appear; if they do, escalate. |
 | `reactivated` | **Medium** | Account transitioned from inactive to active. |
@@ -84,31 +84,49 @@ python veracode_tenant_audit.py --enable-change-detection --snapshot-dir /var/li
 | `deactivated` | Informational | Routine offboarding signal. |
 | `added` | Informational | New UIDs since last snapshot. |
 | `removed` | Informational | UIDs no longer present. Veracode does not recycle usernames so removal is rare. |
-
+ 
 Each category writes its own CSV (`07_<category>.csv`), so even empty categories provide explicit "we checked, found nothing" evidence for the audit trail.
-
+ 
+## Findings history
+ 
+Each run persists actionable findings (Critical, High, Medium, Low) to `findings_history.jsonl` in the snapshot directory. The HTML report's "Recent activity" panel surfaces these past findings grouped by run date, so the customer can see what's been happening over the past several weeks without opening old reports.
+ 
+Configure the lookback window with `--history-window-days` (default 56 = 8 weeks). The JSONL file itself grows append-only and is not pruned automatically; rotate or archive it externally if needed (it stays small — about 200 bytes per finding).
+ 
+Informational findings are not persisted to history to keep the activity panel focused on actionable signals. They still appear in the current run's HTML report and CSV outputs.
+ 
+```bash
+# Default: show last 8 weeks of history in the HTML
+python veracode_tenant_audit.py --enable-change-detection
+ 
+# Show last 6 months
+python veracode_tenant_audit.py --enable-change-detection --history-window-days 180
+```
+ 
+The history file lives in the same `--snapshot-dir` as the user state snapshot, so a single persistent directory is all you need to maintain across runs.
+ 
 ## Scheduling check 7
-
+ 
 Check 7 is designed for periodic execution. The snapshot is persisted between runs, and each run reports the delta. **Recommended cadence: daily**; weekly is acceptable but increases the intra-window blind spot for change-and-revert patterns.
-
+ 
 Example cron entry (daily at 02:00):
 ```
 0 2 * * * cd /opt/veracode-audit && python veracode_tenant_audit.py --enable-change-detection --snapshot-dir /var/lib/veracode-audit --output ./reports/$(date +\%Y-\%m-\%d)
 ```
-
+ 
 The previous N snapshots are auto-rotated under `--snapshot-dir` as `users_snapshot.<timestamp>.json` so you can compare across multiple runs back if needed for forensics.
-
+ 
 Check 7 is designed for periodic execution. Snapshot is persisted between runs, and each run reports the delta. Recommended cadence: **daily** for high-security environments, **weekly** for standard use.
-
+ 
 Example cron entry:
 ```
 0 2 * * * cd /opt/veracode-audit && python veracode_tenant_audit.py --enable-change-detection --snapshot-dir /var/lib/veracode-audit --output ./reports/$(date +\%Y-\%m-\%d)
 ```
 
 ## Outputs
-
+ 
 All files are written to the directory specified by `--output`:
-
+ 
 | File | Content |
 |---|---|
 | `veracode_tenant_audit.html` | Consolidated report with executive summary and findings sorted by severity |
@@ -123,7 +141,9 @@ All files are written to the directory specified by `--output`:
 | `03_applications_team_assignment.csv` | Every application with its team(s) and criticality |
 | `03_applications_without_team.csv` | Applications missing team assignment |
 | `04_privileged_users_active.csv` | Active users with privileged roles |
-| `04_stale_accounts.csv` | Active accounts without recent login |
+| `04_orphan_no_roles.csv` | Active accounts with zero roles assigned |
+| `04_orphan_no_teams.csv` | Active human accounts without team membership |
+| `04_login_disabled_active.csv` | Active accounts with `login_enabled=false` |
 | `04_disabled_accounts.csv` | Inactive/disabled accounts |
 | `05_traceability_capabilities.csv` | Matrix of audit capabilities vs platform gaps |
 | `06_account_hardening.csv` | IP restriction and authentication type per user |
@@ -135,14 +155,14 @@ All files are written to the directory specified by `--output`:
 | `07_privilege_acquired.csv` | *(check 7 only)* UIDs that gained privileged roles |
 | `07_privilege_lost.csv` | *(check 7 only)* UIDs that lost privileged roles |
 | `07_username_collisions.csv` | *(check 7 only)* user_name appearing under a different UID than before |
-| `07_email_collisions.csv` | *(check 7 only)* Same email on 2+ active UIDs in current state |
+| `07_email_collisions.csv` | *(check 7 only)* Same email on 2+ humans or 2+ APIs (excludes legitimate human↔API pairings) |
 | `07_cross_domain_emails.csv` | *(check 7 only)* Email changes that crossed organizational domain |
 | `07_privileged_email_changes.csv` | *(check 7 only)* Email changes on privileged accounts |
 | `<snapshot-dir>/users_snapshot.json` | *(check 7 only)* Current baseline for the next run |
 | `<snapshot-dir>/users_snapshot.<ts>.json` | *(check 7 only)* Rotated snapshots from previous runs (last 4 retained) |
 
 ## Severity thresholds
-
+ 
 | Condition | Severity |
 |---|---|
 | Users without immutable UID | High |
@@ -155,6 +175,7 @@ All files are written to the directory specified by `--output`:
 | Standard users inactive 90+ days | Medium |
 | Self-service audit log gap | Medium |
 | SAML coverage < 80% of active users | Medium |
+ 
 
 Thresholds are defined as constants at the top of the script and can be tuned per engagement.
 
