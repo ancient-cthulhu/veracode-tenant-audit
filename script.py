@@ -281,74 +281,12 @@ def get_paginated(
     return [item for p in sorted(pages) for item in pages[p]]
 
 
-def get_json(ctx: AuditContext, path: str) -> dict:
-    """Single resource GET."""
-    resp = _veracode_get(ctx, f"{ctx.base_url}{path}")
-    _raise_for_known_errors(resp)
-    return resp.json()
-
-
-def fetch_concurrent(
-    ctx: AuditContext,
-    items: list[Any],
-    fetch_fn: Callable[[AuditContext, Any], dict],
-    label: str = "items",
-) -> list[dict | None]:
-    """Run fetch_fn against many items concurrently. Preserves input order.
-    Returns None for failed fetches so callers can decide fallback behavior."""
-    results: list[dict | None] = [None] * len(items)
-    if not items:
-        return results
-
-    log.info("Fetching %d %s concurrently (workers=%d)...", len(items), label, ctx.concurrency)
-
-    with ThreadPoolExecutor(max_workers=ctx.concurrency) as pool:
-        future_to_idx = {
-            pool.submit(fetch_fn, ctx, item): idx
-            for idx, item in enumerate(items)
-        }
-        completed = 0
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except requests.HTTPError as e:
-                log.warning("  failed to fetch %s[%d]: %s", label, idx, e)
-                results[idx] = None
-            completed += 1
-            if completed % 100 == 0:
-                log.info("  %d/%d %s", completed, len(items), label)
-    return results
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def normalize_role_name(name: str) -> str:
     return (name or "").lower().replace(" ", "").replace("_", "").replace("-", "")
-
-
-def parse_last_login(raw: Any) -> dt.datetime | None:
-    """Handle epoch milliseconds, ISO 8601, or missing values."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        try:
-            return dt.datetime.fromtimestamp(float(raw) / 1000, tz=dt.timezone.utc)
-        except (ValueError, OSError, OverflowError):
-            return None
-    if isinstance(raw, str):
-        if raw.isdigit():
-            try:
-                return dt.datetime.fromtimestamp(int(raw) / 1000, tz=dt.timezone.utc)
-            except (ValueError, OSError, OverflowError):
-                return None
-        try:
-            return dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    return None
 
 
 def detect_sod_conflicts(normalized_roles: set[str]) -> list[str]:
@@ -985,6 +923,132 @@ TRACKED_PROFILE_FIELDS = ("email_address", "user_name", "first_name", "last_name
 SNAPSHOT_FILENAME = "users_snapshot.json"
 SNAPSHOT_HISTORY_KEEP = 4  # Keep N rotated snapshots for multi-run comparison
 
+# Persistent findings history (across runs)
+FINDINGS_HISTORY_FILENAME = "findings_history.jsonl"
+DEFAULT_HISTORY_WINDOW_DAYS = 56  # 8 weeks - covers the last ~2 months of weekly runs
+HISTORY_HTML_MAX_RUNS = 12  # Cap how many past runs we render in the HTML panel
+HISTORY_MAX_BYTES = 5 * 1024 * 1024  # 5 MB; rotate when exceeded
+HISTORY_KEEP_GENERATIONS = 4  # Keep N rotated history files
+# Severities included in the persistent history. Informational is excluded
+# so the history stays focused on actionable signals.
+HISTORY_PERSISTED_SEVERITIES: frozenset[str] = frozenset({
+    "Critical", "High", "Medium", "Low",
+})
+
+
+def _rotate_history_if_large(history_path: Path) -> None:
+    """Rotate findings_history.jsonl when it exceeds HISTORY_MAX_BYTES.
+    Keeps the most recent HISTORY_KEEP_GENERATIONS rotated files."""
+    try:
+        if not history_path.exists() or history_path.stat().st_size < HISTORY_MAX_BYTES:
+            return
+    except OSError:
+        return
+
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rotated = history_path.with_name(f"{history_path.stem}.{ts}.jsonl")
+    try:
+        history_path.rename(rotated)
+    except OSError as e:
+        log.warning("Could not rotate findings history: %s", e)
+        return
+
+    archives = sorted(
+        history_path.parent.glob(f"{history_path.stem}.*.jsonl"),
+        reverse=True,
+    )
+    for old in archives[HISTORY_KEEP_GENERATIONS:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def append_findings_to_history(
+    history_path: Path,
+    findings: list[Finding],
+    run_timestamp: dt.datetime,
+    run_metadata: dict[str, Any] | None = None,
+) -> int:
+    """Append findings to the persistent JSONL history file.
+
+    One finding per line, plus run_timestamp and any run metadata. Returns
+    the number of findings actually persisted (Informational is excluded).
+    Safe to call concurrently across processes since each line is atomic
+    in append mode on POSIX filesystems.
+    """
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_history_if_large(history_path)
+    iso_ts = run_timestamp.isoformat()
+    written = 0
+    with history_path.open("a", encoding="utf-8") as f:
+        for finding in findings:
+            if finding.severity not in HISTORY_PERSISTED_SEVERITIES:
+                continue
+            entry = {
+                "run_timestamp": iso_ts,
+                **asdict(finding),
+            }
+            if run_metadata:
+                entry["run_metadata"] = run_metadata
+            f.write(json.dumps(entry) + "\n")
+            written += 1
+    return written
+
+
+def load_findings_history(
+    history_path: Path,
+    window_days: int,
+) -> list[dict]:
+    """Load past findings within the given window from the JSONL file.
+
+    Returns entries sorted by run_timestamp descending (most recent first).
+    Call BEFORE appending the current run so you don't need to filter the
+    current run back out.
+    """
+    if not history_path.exists():
+        return []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)
+    entries: list[dict] = []
+    try:
+        with history_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_str = entry.get("run_timestamp", "")
+                try:
+                    ts = dt.datetime.fromisoformat(ts_str)
+                except (ValueError, TypeError):
+                    continue
+                if ts < cutoff:
+                    continue
+                entries.append(entry)
+    except OSError as e:
+        log.warning("Could not read findings history: %s", e)
+        return []
+    entries.sort(key=lambda e: e.get("run_timestamp", ""), reverse=True)
+    return entries
+
+
+def group_history_by_run(history_entries: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Group history entries by run_timestamp, preserving descending order.
+    Returns a list of (run_timestamp, [entries]) tuples, capped at
+    HISTORY_HTML_MAX_RUNS most recent runs."""
+    by_run: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for e in history_entries:
+        ts = e.get("run_timestamp", "")
+        if ts not in by_run:
+            by_run[ts] = []
+            order.append(ts)
+        by_run[ts].append(e)
+    return [(ts, by_run[ts]) for ts in order[:HISTORY_HTML_MAX_RUNS]]
+
 
 def _extract_snapshot_user(u: dict) -> dict:
     """Minimal projection of a user record for snapshotting. Includes
@@ -1002,15 +1066,27 @@ def _extract_snapshot_user(u: dict) -> dict:
 
 
 def load_previous_snapshot(snapshot_path: Path) -> dict[str, dict] | None:
-    """Load the previous snapshot keyed by user_id. Returns None if absent."""
+    """Load the previous snapshot keyed by user_id. Returns None if absent
+    or if the file is unreadable/corrupt — in either case the caller treats
+    this as a first run and creates a fresh baseline."""
     if not snapshot_path.exists():
         return None
     try:
         data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-        return data.get("users", {})
     except (json.JSONDecodeError, OSError) as e:
-        log.warning("Could not read previous snapshot: %s", e)
+        log.warning("Snapshot unreadable at %s, treating as first run: %s",
+                    snapshot_path, e)
         return None
+    if not isinstance(data, dict):
+        log.warning("Snapshot at %s is not a dict, treating as first run",
+                    snapshot_path)
+        return None
+    users = data.get("users")
+    if not isinstance(users, dict):
+        log.warning("Snapshot at %s missing 'users' dict, treating as first run",
+                    snapshot_path)
+        return None
+    return users
 
 
 def write_snapshot(snapshot_path: Path, users: list[dict]) -> None:
@@ -1209,21 +1285,50 @@ def diff_snapshots(
         if uid not in current_by_id
     ]
 
-    # 3. Email collisions in CURRENT state: same email on multiple active UIDs
-    email_to_uids: dict[str, list[str]] = {}
+    # 3. Email collisions in CURRENT state.
+    #
+    # Veracode allows the same email address to appear on a human user and
+    # their paired API service account (this is a documented and intentional
+    # pattern). To avoid false positives we only flag collisions where the
+    # colliding accounts are of the same type: 2+ human accounts sharing an
+    # email (true duplicate), or 2+ API service accounts sharing an email
+    # (also unexpected). A single human paired with a single API account is
+    # NOT flagged.
+    #
+    # Note: usernames are documented as globally unique and non-recyclable on
+    # the Veracode platform, so username_collisions remains the more
+    # authoritative integrity signal.
+    email_to_accounts: dict[str, list[tuple[str, bool]]] = {}
     for uid, u in current_by_id.items():
         if not u.get("active"):
             continue
         email = (u.get("email_address") or "").lower()
-        if email:
-            email_to_uids.setdefault(email, []).append(uid)
-    for email, uids in email_to_uids.items():
-        if len(uids) > 1:
-            out["email_collisions"].append({
-                "email": email,
-                "uid_count": len(uids),
-                "uids": ",".join(sorted(uids)),
-            })
+        if not email:
+            continue
+        is_api = is_api_service_account(u)
+        email_to_accounts.setdefault(email, []).append((uid, is_api))
+
+    for email, accounts in email_to_accounts.items():
+        if len(accounts) < 2:
+            continue
+        human_uids = [uid for uid, is_api in accounts if not is_api]
+        api_uids = [uid for uid, is_api in accounts if is_api]
+        # Legitimate pattern: one human paired with one or more API accounts.
+        # Real concern: 2+ humans, or 2+ APIs, sharing one email.
+        is_real_collision = len(human_uids) > 1 or len(api_uids) > 1
+        if not is_real_collision:
+            continue
+        out["email_collisions"].append({
+            "email": email,
+            "uid_count": len(accounts),
+            "human_uids": ",".join(sorted(human_uids)),
+            "api_uids": ",".join(sorted(api_uids)),
+            "collision_type": (
+                "multiple_humans" if len(human_uids) > 1 and not api_uids
+                else "multiple_apis" if len(api_uids) > 1 and not human_uids
+                else "mixed_duplicate"
+            ),
+        })
 
     return out
 
@@ -1311,7 +1416,8 @@ def check7_profile_changes(
                            "roles_removed", "current_roles"],
         "username_collisions": ["uid", "current_user_name",
                                 "previously_held_by_uid", "current_email"],
-        "email_collisions": ["email", "uid_count", "uids"],
+        "email_collisions": ["email", "uid_count", "collision_type",
+                              "human_uids", "api_uids"],
         "cross_domain_emails": ["uid", "field", "old_value", "new_value",
                                 "old_domain", "new_domain",
                                 "current_user_name", "is_privileged"],
@@ -1388,10 +1494,12 @@ def _drift_detail(category: str, rows: list[dict]) -> str:
         )
     if category == "email_collisions":
         return (
-            "Same email address is held by two or more active UIDs in the "
-            "current state. Often indicates duplicate accounts, IdP "
-            "misconfiguration, or attempted impersonation. Investigate "
-            "ownership and consolidate."
+            "Same email address is held by 2+ human accounts, or 2+ API service "
+            "accounts, in the current state. Often indicates duplicate accounts, "
+            "IdP misconfiguration, or attempted impersonation. Investigate "
+            "ownership and consolidate. Note: a single human paired with their "
+            "own API service account using the same email is intentional Veracode "
+            "behavior and is NOT flagged here."
         )
     if category == "reactivated":
         return (
@@ -1561,7 +1669,101 @@ def _check_status_badge(findings_in_check: list[Finding]) -> str:
     return "".join(pieces)
 
 
-def render_html(ctx: AuditContext, totals: dict[str, int]) -> Path:
+def _render_history_panel(history_entries: list[dict], window_days: int) -> str:
+    """Render the 'Recent activity' panel showing past findings grouped by run.
+    Returns empty string if there is no history to display."""
+    if not history_entries:
+        return ""
+
+    runs = group_history_by_run(history_entries)
+    if not runs:
+        return ""
+
+    # Aggregate severity counts across the window for the header summary
+    window_counts: dict[str, int] = {}
+    for e in history_entries:
+        sev = e.get("severity", "")
+        if sev:
+            window_counts[sev] = window_counts.get(sev, 0) + 1
+
+    summary_chips = " ".join(
+        f'<span class="chip" style="background: {SEVERITY_COLORS[s]}">'
+        f'{html.escape(s)}: {n}</span>'
+        for s, n in sorted(window_counts.items(),
+                           key=lambda kv: SEVERITY_ORDER.get(kv[0], 99))
+    )
+
+    run_blocks: list[str] = []
+    for run_ts, entries in runs:
+        # Format the timestamp for display
+        try:
+            run_dt = dt.datetime.fromisoformat(run_ts)
+            display_date = run_dt.strftime("%Y-%m-%d %H:%M UTC")
+            iso_date = run_dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            display_date = run_ts
+            iso_date = run_ts
+
+        # Severity tally for this run
+        run_sev_counts: dict[str, int] = {}
+        for e in entries:
+            sev = e.get("severity", "")
+            if sev:
+                run_sev_counts[sev] = run_sev_counts.get(sev, 0) + 1
+        run_chips = " ".join(
+            f'<span class="status-badge" style="background: {SEVERITY_COLORS[s]}">'
+            f'{n} {s.lower()}</span>'
+            for s, n in sorted(run_sev_counts.items(),
+                               key=lambda kv: SEVERITY_ORDER.get(kv[0], 99))
+        )
+
+        finding_rows = "".join(
+            f'<tr>'
+            f'<td><span class="sev-badge" style="background: {SEVERITY_COLORS.get(e.get("severity", ""), "#888")}">{html.escape(e.get("severity", ""))}</span></td>'
+            f'<td>{html.escape(e.get("check", ""))}</td>'
+            f'<td>{html.escape(e.get("title", ""))}</td>'
+            f'</tr>'
+            for e in entries
+        )
+
+        # Auto-expand the most recent run, collapse the rest
+        is_open = "open" if run_ts == runs[0][0] else ""
+        run_blocks.append(f"""
+        <details class="history-run" {is_open}>
+          <summary>
+            <div class="history-run-left">
+              <span class="history-date">{html.escape(iso_date)}</span>
+              <span class="history-time">{html.escape(display_date)}</span>
+            </div>
+            <div class="history-run-right">{run_chips}</div>
+          </summary>
+          <table class="history-table">
+            <thead><tr><th>Severity</th><th>Check</th><th>Finding</th></tr></thead>
+            <tbody>{finding_rows}</tbody>
+          </table>
+        </details>""")
+
+    return f"""
+        <section class="history-panel">
+          <h2>Recent activity (last {window_days} days)</h2>
+          <div class="history-summary">
+            <div style="font-size: 12px; color: #586069; margin-bottom: 8px;">
+              Findings from past runs (current run excluded). Informational findings are not retained.
+            </div>
+            <div>{summary_chips}</div>
+          </div>
+          <div class="history-runs">
+            {''.join(run_blocks)}
+          </div>
+        </section>"""
+
+
+def render_html(
+    ctx: AuditContext,
+    totals: dict[str, int],
+    history_entries: list[dict] | None = None,
+    history_window_days: int = DEFAULT_HISTORY_WINDOW_DAYS,
+) -> Path:
     findings = ctx.sorted_findings()
 
     # Group findings by check number
@@ -1588,6 +1790,11 @@ def render_html(ctx: AuditContext, totals: dict[str, int]) -> Path:
           <h2>Needs attention this run</h2>
           {cards}
         </section>"""
+
+    # Recent activity panel (history from past runs)
+    history_panel_html = _render_history_panel(
+        history_entries or [], history_window_days
+    )
 
     # Per-check accordion sections
     check_sections: list[str] = []
@@ -1796,6 +2003,45 @@ def render_html(ctx: AuditContext, totals: dict[str, int]) -> Path:
       font-size: 12px; color: #586069; padding: 12px 0;
       font-style: italic;
     }}
+    .history-panel {{
+      border-top: 4px solid #586069;
+    }}
+    .history-panel h2 {{ color: #586069; }}
+    .history-summary {{ margin-bottom: 14px; }}
+    details.history-run {{
+      background: #fafbfc; border: 1px solid #e1e4e8;
+      border-radius: 6px; margin-bottom: 6px;
+    }}
+    details.history-run[open] {{ background: white; border-color: #c8d0d9; }}
+    details.history-run summary {{
+      padding: 9px 14px; cursor: pointer; list-style: none;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 13px;
+    }}
+    details.history-run summary::-webkit-details-marker {{ display: none; }}
+    details.history-run summary::before {{
+      content: '▸'; margin-right: 8px; color: #586069;
+      transition: transform 0.15s; display: inline-block; font-size: 11px;
+    }}
+    details.history-run[open] summary::before {{ transform: rotate(90deg); }}
+    .history-run-left {{ display: flex; align-items: baseline; gap: 12px; flex: 1; }}
+    .history-date {{ font-weight: 500; }}
+    .history-time {{ font-size: 11px; color: #586069; }}
+    .history-run-right {{ display: flex; gap: 4px; }}
+    table.history-table {{
+      width: 100%; border-collapse: collapse; font-size: 12px;
+      border-top: 1px solid #f0f2f5;
+    }}
+    table.history-table th {{
+      text-align: left; padding: 6px 14px; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.3px;
+      color: #586069; background: #f5f6fa; font-weight: 500;
+    }}
+    table.history-table td {{
+      padding: 6px 14px; border-top: 1px solid #f0f2f5;
+      vertical-align: top;
+    }}
+    table.history-table td:first-child {{ width: 90px; }}
     .footer-note {{
       font-size: 11px; color: #586069; text-align: center;
       padding: 16px; margin-top: 8px;
@@ -1824,9 +2070,12 @@ def render_html(ctx: AuditContext, totals: dict[str, int]) -> Path:
       {''.join(check_sections)}
     </section>
 
+    {history_panel_html}
+
     <div class="footer-note">
       Full evidence is in CSV files under the same output directory.
       For SIEM ingestion, use <code>findings.json</code>.
+      Persistent finding history is in <code>findings_history.jsonl</code> under the snapshot directory.
     </div>
   </main>
 </body>
@@ -1974,6 +2223,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--snapshot-dir", default="./snapshots",
                    help="Directory where the user state snapshot is persisted "
                         "across runs (default: ./snapshots)")
+    p.add_argument("--history-window-days", type=int,
+                   default=DEFAULT_HISTORY_WINDOW_DAYS,
+                   help=f"Days of past findings to display in the 'Recent activity' "
+                        f"panel of the HTML report (default {DEFAULT_HISTORY_WINDOW_DAYS}, "
+                        f"i.e. ~8 weeks). Findings are persisted to "
+                        f"findings_history.jsonl in the snapshot dir indefinitely.")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args(argv)
 
@@ -1982,11 +2237,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     configure_logging(args.verbose)
 
+    # Clamp risky values rather than letting them silently degrade behavior.
     if args.rate_limit > 250:
-        log.warning(
-            "rate-limit=%d exceeds Veracode documented cap of 250 req/min. "
-            "Throttling errors are likely.", args.rate_limit,
-        )
+        log.warning("Clamping --rate-limit %d to 250 (Veracode documented cap)",
+                    args.rate_limit)
+        args.rate_limit = 250
+    if args.rate_limit < 1:
+        args.rate_limit = 1
+    if args.concurrency < 1:
+        args.concurrency = 1
+    if args.concurrency > 32:
+        log.warning("Clamping --concurrency %d to 32", args.concurrency)
+        args.concurrency = 32
 
     ctx = AuditContext(
         base_url=REGIONS[args.region],
@@ -2025,6 +2287,27 @@ def main(argv: list[str] | None = None) -> int:
         [asdict(f) for f in ctx.sorted_findings()],
     )
 
+    # Load PAST history for the HTML panel BEFORE appending the current
+    # run's findings. This means we don't need to filter the current run
+    # back out of what we just wrote, and avoids a write-then-read round trip.
+    snapshot_dir = Path(args.snapshot_dir)
+    history_path = snapshot_dir / FINDINGS_HISTORY_FILENAME
+    history_entries = load_findings_history(
+        history_path, window_days=args.history_window_days,
+    )
+    log.info("Loaded %d past findings within last %d days for history panel",
+             len(history_entries), args.history_window_days)
+
+    # Now append this run's findings to the persistent history.
+    run_timestamp = dt.datetime.now(dt.timezone.utc)
+    persisted = append_findings_to_history(
+        history_path,
+        ctx.findings,
+        run_timestamp,
+        run_metadata={"region": args.region, "output_dir": str(ctx.output_dir)},
+    )
+    log.info("Persisted %d findings to history at %s", persisted, history_path)
+
     totals = {
         "Total users": len(users),
         "Active users": sum(1 for u in users if u.get("active")),
@@ -2032,7 +2315,11 @@ def main(argv: list[str] | None = None) -> int:
         "Applications": len(applications),
         "Findings": len(ctx.findings),
     }
-    report_path = render_html(ctx, totals)
+    report_path = render_html(
+        ctx, totals,
+        history_entries=history_entries,
+        history_window_days=args.history_window_days,
+    )
 
     log.info("HTML report: %s", report_path)
     log.info("Evidence directory: %s", ctx.output_dir.resolve())
