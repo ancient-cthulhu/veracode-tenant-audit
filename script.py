@@ -1050,6 +1050,122 @@ def group_history_by_run(history_entries: list[dict]) -> list[tuple[str, list[di
     return [(ts, by_run[ts]) for ts in order[:HISTORY_HTML_MAX_RUNS]]
 
 
+# ---------------------------------------------------------------------------
+# Profile changes audit log
+# ---------------------------------------------------------------------------
+#
+# Forensic record of every individual profile attribute change ever detected.
+# Distinct from findings_history.jsonl (which records aggregated finding
+# counts per run): this file records each individual change with full context
+# so an auditor can answer "what changed on uid-X in the last N months?"
+# with a single grep.
+#
+# Append-only, never rotated by default (these records are evidence).
+
+PROFILE_CHANGES_FILENAME = "profile_changes_audit.jsonl"
+DEFAULT_PROFILE_HISTORY_WINDOW_DAYS = 365  # 1 year of changes in the HTML panel
+PROFILE_HTML_MAX_ROWS = 100  # Cap rows shown in the HTML panel for legibility
+
+
+def append_profile_changes(
+    audit_path: Path,
+    drift: dict[str, list[dict]],
+    detected_at: dt.datetime,
+) -> int:
+    """Append every individual profile attribute change from a drift result
+    to the persistent audit log. One JSON line per (uid, field) change.
+
+    Each line includes the change context, which subcategories the change
+    qualifies for (cross_domain_emails, privileged_email_changes), and the
+    detection timestamp. Returns the number of lines written.
+    """
+    field_changes = drift.get("field_changes") or []
+    if not field_changes:
+        return 0
+
+    # Build lookup sets so we can mark each field_change row with the
+    # subcategories it also belongs to (a single change can be both
+    # cross-domain AND privileged).
+    cross_domain_keys: set[tuple[str, str]] = {
+        (r["uid"], r["field"]) for r in (drift.get("cross_domain_emails") or [])
+    }
+    privileged_keys: set[tuple[str, str]] = {
+        (r["uid"], r["field"]) for r in (drift.get("privileged_email_changes") or [])
+    }
+    cross_domain_lookup: dict[tuple[str, str], dict] = {
+        (r["uid"], r["field"]): r for r in (drift.get("cross_domain_emails") or [])
+    }
+
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    iso_ts = detected_at.isoformat()
+    written = 0
+    with audit_path.open("a", encoding="utf-8") as f:
+        for change in field_changes:
+            key = (change["uid"], change["field"])
+            entry = {
+                "detected_at": iso_ts,
+                "uid": change["uid"],
+                "field": change["field"],
+                "old_value": change["old_value"],
+                "new_value": change["new_value"],
+                "current_user_name": change.get("current_user_name", ""),
+                "current_email": change.get("current_email", ""),
+                "active": change.get("active"),
+                "is_privileged": change.get("is_privileged", False),
+                "subcategories": [
+                    *(["cross_domain_emails"] if key in cross_domain_keys else []),
+                    *(["privileged_email_changes"] if key in privileged_keys else []),
+                ],
+            }
+            # Add domain info for cross-domain entries
+            if key in cross_domain_lookup:
+                entry["old_domain"] = cross_domain_lookup[key].get("old_domain", "")
+                entry["new_domain"] = cross_domain_lookup[key].get("new_domain", "")
+            f.write(json.dumps(entry) + "\n")
+            written += 1
+    return written
+
+
+def load_profile_changes(
+    audit_path: Path,
+    window_days: int,
+    uid_filter: str | None = None,
+) -> list[dict]:
+    """Load profile changes within the time window. Optionally filter by uid.
+
+    Returns entries sorted by detected_at descending (most recent first).
+    """
+    if not audit_path.exists():
+        return []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)
+    entries: list[dict] = []
+    try:
+        with audit_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if uid_filter and entry.get("uid") != uid_filter:
+                    continue
+                ts_str = entry.get("detected_at", "")
+                try:
+                    ts = dt.datetime.fromisoformat(ts_str)
+                except (ValueError, TypeError):
+                    continue
+                if ts < cutoff:
+                    continue
+                entries.append(entry)
+    except OSError as e:
+        log.warning("Could not read profile changes audit: %s", e)
+        return []
+    entries.sort(key=lambda e: e.get("detected_at", ""), reverse=True)
+    return entries
+
+
 def _extract_snapshot_user(u: dict) -> dict:
     """Minimal projection of a user record for snapshotting. Includes
     fields needed for drift detection beyond the tracked profile fields."""
@@ -1397,6 +1513,18 @@ def check7_profile_changes(
         return
 
     drift = diff_snapshots(previous, users)
+
+    # Persist every individual profile change to the long-lived audit log.
+    # This is separate from the per-run findings_history.jsonl because it
+    # captures granular old/new values per (uid, field) pair, suitable for
+    # forensic queries over months/years.
+    audit_path = snapshot_dir / PROFILE_CHANGES_FILENAME
+    persisted_changes = append_profile_changes(
+        audit_path, drift, dt.datetime.now(dt.timezone.utc)
+    )
+    if persisted_changes:
+        log.info("Persisted %d profile changes to audit log at %s",
+                 persisted_changes, audit_path)
 
     # Persist all evidence categories. Empty CSVs are still useful as
     # explicit "we checked and found nothing" evidence.
@@ -1758,11 +1886,127 @@ def _render_history_panel(history_entries: list[dict], window_days: int) -> str:
         </section>"""
 
 
+def _render_profile_changes_panel(
+    profile_changes: list[dict],
+    window_days: int,
+) -> str:
+    """Render the long-form profile change audit panel: every email/name
+    change ever detected within the window, grouped by UID. Distinct from
+    the 'Recent activity' panel which shows finding aggregates per run."""
+    if not profile_changes:
+        return ""
+
+    # Group by UID, keep most recent first
+    by_uid: dict[str, list[dict]] = {}
+    for entry in profile_changes:
+        uid = entry.get("uid", "")
+        by_uid.setdefault(uid, []).append(entry)
+
+    # Order UIDs by most-recent-change descending
+    uids_ordered = sorted(
+        by_uid.keys(),
+        key=lambda u: by_uid[u][0].get("detected_at", ""),
+        reverse=True,
+    )
+
+    # Per-UID summary rows
+    user_blocks: list[str] = []
+    total_changes = len(profile_changes)
+    privileged_changes = sum(1 for e in profile_changes if e.get("is_privileged"))
+    cross_domain_changes = sum(
+        1 for e in profile_changes
+        if "cross_domain_emails" in (e.get("subcategories") or [])
+    )
+
+    for uid in uids_ordered:
+        changes = by_uid[uid]
+        most_recent = changes[0]
+        current_user_name = most_recent.get("current_user_name", "")
+        current_email = most_recent.get("current_email", "")
+        is_priv = any(c.get("is_privileged") for c in changes)
+        priv_badge = (
+            '<span class="status-badge" style="background: #c0392b">privileged</span>'
+            if is_priv else ""
+        )
+
+        change_rows = "".join(
+            f'<tr>'
+            f'<td>{html.escape(c.get("detected_at", "")[:10])}</td>'
+            f'<td><code>{html.escape(c.get("field", ""))}</code></td>'
+            f'<td class="cell-long" title="{html.escape(c.get("old_value", ""))}">{html.escape(c.get("old_value", ""))}</td>'
+            f'<td class="cell-long" title="{html.escape(c.get("new_value", ""))}">{html.escape(c.get("new_value", ""))}</td>'
+            f'<td>{html.escape(", ".join(c.get("subcategories") or []) or "-")}</td>'
+            f'</tr>'
+            for c in changes
+        )
+
+        user_blocks.append(f"""
+        <details class="profile-uid-block">
+          <summary>
+            <div class="profile-uid-summary-left">
+              <span class="profile-uid">{html.escape(uid)}</span>
+              <span class="profile-uid-meta">{html.escape(current_user_name)} · {html.escape(current_email)}</span>
+            </div>
+            <div class="profile-uid-summary-right">
+              {priv_badge}
+              <span class="status-badge" style="background: #586069">{len(changes)} changes</span>
+            </div>
+          </summary>
+          <div class="evidence-wrap">
+            <table class="evidence">
+              <thead>
+                <tr><th>Detected</th><th>Field</th><th>Old value</th><th>New value</th><th>Tags</th></tr>
+              </thead>
+              <tbody>{change_rows}</tbody>
+            </table>
+          </div>
+        </details>""")
+
+    # Cap rows shown for legibility
+    if len(profile_changes) > PROFILE_HTML_MAX_ROWS:
+        truncation_note = (
+            f'<div class="more-note" style="margin-top: 8px;">'
+            f'Showing changes across {len(uids_ordered)} UIDs. '
+            f'Full record (all {total_changes} changes) in '
+            f'<code>{PROFILE_CHANGES_FILENAME}</code>.'
+            f'</div>'
+        )
+    else:
+        truncation_note = ""
+
+    summary_html = (
+        f'<div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">'
+        f'<span class="chip" style="background: #c0392b">{total_changes} changes</span>'
+        f'<span class="chip" style="background: #d68910">{len(uids_ordered)} UIDs affected</span>'
+        + (f'<span class="chip" style="background: #7a1f1f">{privileged_changes} on privileged accounts</span>'
+           if privileged_changes else "")
+        + (f'<span class="chip" style="background: #c0392b">{cross_domain_changes} cross-domain</span>'
+           if cross_domain_changes else "")
+        + '</div>'
+    )
+
+    return f"""
+        <section class="profile-changes-panel">
+          <h2>Profile change history (last {window_days} days)</h2>
+          <div style="font-size: 12px; color: #586069; margin-bottom: 12px;">
+            Every email and name change ever detected, grouped by UID. Persistent forensic record;
+            never rotated. Click a UID to expand its full change history.
+          </div>
+          {summary_html}
+          <div class="profile-uid-list">
+            {''.join(user_blocks)}
+          </div>
+          {truncation_note}
+        </section>"""
+
+
 def render_html(
     ctx: AuditContext,
     totals: dict[str, int],
     history_entries: list[dict] | None = None,
     history_window_days: int = DEFAULT_HISTORY_WINDOW_DAYS,
+    profile_changes: list[dict] | None = None,
+    profile_window_days: int = DEFAULT_PROFILE_HISTORY_WINDOW_DAYS,
 ) -> Path:
     findings = ctx.sorted_findings()
 
@@ -1794,6 +2038,11 @@ def render_html(
     # Recent activity panel (history from past runs)
     history_panel_html = _render_history_panel(
         history_entries or [], history_window_days
+    )
+
+    # Profile change history panel (per-UID forensic log)
+    profile_panel_html = _render_profile_changes_panel(
+        profile_changes or [], profile_window_days
     )
 
     # Per-check accordion sections
@@ -2042,6 +2291,33 @@ def render_html(
       vertical-align: top;
     }}
     table.history-table td:first-child {{ width: 90px; }}
+    .profile-changes-panel {{
+      border-top: 4px solid #c0392b;
+    }}
+    .profile-changes-panel h2 {{ color: #c0392b; }}
+    details.profile-uid-block {{
+      background: #fafbfc; border: 1px solid #e1e4e8;
+      border-radius: 6px; margin-bottom: 6px;
+    }}
+    details.profile-uid-block[open] {{ background: white; border-color: #c8d0d9; }}
+    details.profile-uid-block summary {{
+      padding: 10px 14px; cursor: pointer; list-style: none;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 13px;
+    }}
+    details.profile-uid-block summary::-webkit-details-marker {{ display: none; }}
+    details.profile-uid-block summary::before {{
+      content: '▸'; margin-right: 8px; color: #586069;
+      transition: transform 0.15s; display: inline-block; font-size: 11px;
+    }}
+    details.profile-uid-block[open] summary::before {{ transform: rotate(90deg); }}
+    .profile-uid-summary-left {{ display: flex; align-items: baseline; gap: 12px; flex: 1; min-width: 0; }}
+    .profile-uid {{ font-family: 'SF Mono', Consolas, monospace; font-weight: 500; font-size: 12px; }}
+    .profile-uid-meta {{
+      font-size: 12px; color: #586069;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }}
+    .profile-uid-summary-right {{ display: flex; gap: 6px; flex-shrink: 0; }}
     .footer-note {{
       font-size: 11px; color: #586069; text-align: center;
       padding: 16px; margin-top: 8px;
@@ -2071,6 +2347,8 @@ def render_html(
     </section>
 
     {history_panel_html}
+
+    {profile_panel_html}
 
     <div class="footer-note">
       Full evidence is in CSV files under the same output directory.
@@ -2229,6 +2507,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         f"panel of the HTML report (default {DEFAULT_HISTORY_WINDOW_DAYS}, "
                         f"i.e. ~8 weeks). Findings are persisted to "
                         f"findings_history.jsonl in the snapshot dir indefinitely.")
+    p.add_argument("--profile-window-days", type=int,
+                   default=DEFAULT_PROFILE_HISTORY_WINDOW_DAYS,
+                   help=f"Days of profile attribute changes to display in the "
+                        f"'Profile change history' panel (default "
+                        f"{DEFAULT_PROFILE_HISTORY_WINDOW_DAYS}). All changes are "
+                        f"persisted to profile_changes_audit.jsonl in the snapshot "
+                        f"dir; this flag only controls what the HTML panel shows.")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args(argv)
 
@@ -2308,6 +2593,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     log.info("Persisted %d findings to history at %s", persisted, history_path)
 
+    # Load the long-form profile change audit log for the HTML panel. Note
+    # that check 7 has already appended the current run's profile changes
+    # before we get here, so this load includes them - which is what we want
+    # in the panel (the customer wants to see "everything that changed").
+    profile_audit_path = snapshot_dir / PROFILE_CHANGES_FILENAME
+    profile_changes = load_profile_changes(
+        profile_audit_path, window_days=args.profile_window_days,
+    )
+    log.info("Loaded %d profile changes within last %d days for the audit panel",
+             len(profile_changes), args.profile_window_days)
+
     totals = {
         "Total users": len(users),
         "Active users": sum(1 for u in users if u.get("active")),
@@ -2319,6 +2615,8 @@ def main(argv: list[str] | None = None) -> int:
         ctx, totals,
         history_entries=history_entries,
         history_window_days=args.history_window_days,
+        profile_changes=profile_changes,
+        profile_window_days=args.profile_window_days,
     )
 
     log.info("HTML report: %s", report_path)
