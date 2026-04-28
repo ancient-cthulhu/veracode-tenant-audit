@@ -176,7 +176,6 @@ All files are written to the directory specified by `--output`:
 | Self-service audit log gap | Medium |
 | SAML coverage < 80% of active users | Medium |
  
-
 Thresholds are defined as constants at the top of the script and can be tuned per engagement.
 
 ## Limitations
