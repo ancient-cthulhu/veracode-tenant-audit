@@ -1351,7 +1351,7 @@ _DRIFT_SEVERITY: dict[str, tuple[str, str, str]] = {
         "{n} email addresses are shared across multiple active UIDs"),
     "reactivated": ("Medium", "Account Lifecycle",
         "{n} accounts reactivated since last snapshot"),
-    "field_changes": ("Medium", "Identity Integrity",
+    "field_changes": ("High", "Identity Integrity",
         "{n} profile attribute changes detected"),
     "privilege_lost": ("Informational", "Privileged Access Review",
         "{n} users lost privileged roles since last snapshot"),
